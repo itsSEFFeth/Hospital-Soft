@@ -884,6 +884,7 @@ local morphPage = addTab("Morph")
 
 local currentMorph = nil   -- клон предмета, надетый на игрока
 local morphActive  = false
+local morphHideOwnName = false   -- при морфе прячем свой ник (читает вкладка Names)
 local morphWeld    = nil   -- сварка опоры к игроку (через её C0 двигаем морф)
 local offX, offY, offZ = 0, 0, 0   -- смещение морфа (в локальных осях игрока)
 
@@ -905,7 +906,9 @@ end
 -- снять морф и вернуть свою видимость
 local function removeMorph()
 	morphActive = false
+	morphHideOwnName = false
 	morphWeld = nil
+
 	if currentMorph then
 		currentMorph:Destroy()
 		currentMorph = nil
@@ -920,7 +923,7 @@ local function removeMorph()
 	end
 end
 
--- надеть морф
+-- надеть морф (только предметы)
 local function applyMorph(model)
 	removeMorph()
 
@@ -930,18 +933,21 @@ local function applyMorph(model)
 	if partCount(model) == 0 then return end
 
 	local clone = model:Clone()
-	-- вырезаем скрипты предмета, чтобы его логика не запускалась
+	-- вырезаем скрипты, чтобы их логика не запускалась
 	for _, s in ipairs(clone:GetDescendants()) do
 		if s:IsA("LuaSourceContainer") then s:Destroy() end
 	end
+	-- убираем чужие таблички/гуи над морфом
+	for _, g in ipairs(clone:GetDescendants()) do
+		if g:IsA("BillboardGui") or g:IsA("SurfaceGui") then g:Destroy() end
+	end
 	clone.Name = "TyomichMorph"
 
-	-- ставим предмет на позицию игрока
 	if clone:IsA("Model") then
 		clone:PivotTo(hrp.CFrame)
 	end
 
-	-- невидимая опора в позиции игрока: к ней приварим все части,
+	-- невидимая опора в позиции игрока: к ней привариваем все части,
 	-- а саму опору — к игроку сваркой с управляемым смещением (C0)
 	local root = Instance.new("Part")
 	root.Name = "MorphRoot"
@@ -953,7 +959,6 @@ local function applyMorph(model)
 	root.CFrame = hrp.CFrame
 	root.Parent = clone
 
-	-- части предмета привариваем к опоре (сохраняя их взаимное расположение)
 	for _, p in ipairs(clone:GetDescendants()) do
 		if p:IsA("BasePart") and p ~= root then
 			p.Anchored = false
@@ -966,7 +971,6 @@ local function applyMorph(model)
 		end
 	end
 
-	-- опору крепим к игроку сваркой; C0 = смещение, его двигаем вживую
 	local weld = Instance.new("Weld")
 	weld.Part0 = hrp
 	weld.Part1 = root
@@ -977,6 +981,7 @@ local function applyMorph(model)
 	clone.Parent = char
 	currentMorph = clone
 	morphActive = true
+	morphHideOwnName = true
 
 	-- авто 3 лицо, чтобы видеть превращение
 	selfTP = true
@@ -1246,6 +1251,503 @@ resetShiftBtn.MouseButton1Click:Connect(function()
 	customText = nil
 	clearShiftLocks()
 end)
+
+--==================================================================
+--  ВКЛАДКА: NAMES  (скрыть/переименовать ники — визуально, только у тебя)
+--==================================================================
+local namesPage = addTab("Names")
+
+-- [plr] = { manualHide=bool, custom=string|nil }
+local nameOverrides = {}
+-- [plr] = { bb=BillboardGui|nil, label=TextLabel|nil }  (кэш найденного тега)
+local tagCache = {}
+
+-- ищем тег с ником игрока: лейбл, чей текст = имени игрока
+local function resolveNameTag(plr)
+	local char = plr.Character
+	if not char then return nil, nil end
+	local n1, n2 = plr.Name, plr.DisplayName
+
+	-- 1) внутри модели персонажа
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("TextLabel") and (d.Text == n1 or d.Text == n2) then
+			return d:FindFirstAncestorWhichIsA("BillboardGui"), d
+		end
+	end
+	-- 2) BillboardGui в workspace, привязанный к персонажу
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("BillboardGui") and d.Adornee and d.Adornee:IsDescendantOf(char) then
+			for _, t in ipairs(d:GetDescendants()) do
+				if t:IsA("TextLabel") and (t.Text == n1 or t.Text == n2) then
+					return d, t
+				end
+			end
+		end
+	end
+	return nil, nil
+end
+
+-- применяем состояние каждые 0.2с (кэшируем, ищем заново только при необходимости)
+local nameAcc = 0
+RunService.Heartbeat:Connect(function(dt)
+	nameAcc += dt
+	if nameAcc < 0.2 then return end
+	nameAcc = 0
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local st = nameOverrides[plr]
+		local hide = (st and st.manualHide) or (plr == player and morphHideOwnName)
+		local custom = st and st.custom
+
+		if hide or custom then
+			local c = tagCache[plr]
+			local invalid = (not c) or (not c.label) or (not c.label.Parent)
+				or (c.bb and not c.bb.Parent)
+			if invalid then
+				local bb, label = resolveNameTag(plr)
+				c = { bb = bb, label = label }
+				tagCache[plr] = c
+			end
+			if c.bb then
+				c.bb.Enabled = not hide
+			elseif c.label then
+				c.label.Visible = not hide
+			end
+			if custom and not hide and c.label and c.label.Text ~= custom then
+				c.label.Text = custom
+			end
+		else
+			-- ничего не активно — один раз возвращаем как было и забываем
+			local c = tagCache[plr]
+			if c then
+				if c.bb and c.bb.Parent then c.bb.Enabled = true end
+				if c.label and c.label.Parent then c.label.Visible = true end
+				tagCache[plr] = nil
+			end
+		end
+	end
+end)
+
+-- сброс кэша тега при респавне (тег пересоздаётся)
+local function watchRespawn(plr)
+	plr.CharacterAdded:Connect(function()
+		tagCache[plr] = nil
+	end)
+end
+for _, plr in ipairs(Players:GetPlayers()) do watchRespawn(plr) end
+Players.PlayerAdded:Connect(watchRespawn)
+
+--// интерфейс вкладки Names
+local hideAllOn = false
+local hideAllBtn = makeButton(namesPage, "Скрыть все ники: ВЫКЛ", 32)
+hideAllBtn.Size = UDim2.new(1, 0, 0, 30)
+
+local namesScroll = Instance.new("ScrollingFrame")
+namesScroll.Size = UDim2.new(1, 0, 1, -42)
+namesScroll.Position = UDim2.new(0, 0, 0, 38)
+namesScroll.BackgroundTransparency = 1
+namesScroll.BorderSizePixel = 0
+namesScroll.ScrollBarThickness = 4
+namesScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+namesScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+namesScroll.Parent = namesPage
+
+local namesLayout = Instance.new("UIListLayout")
+namesLayout.Padding = UDim.new(0, 5)
+namesLayout.SortOrder = Enum.SortOrder.LayoutOrder
+namesLayout.Parent = namesScroll
+
+local function getOverride(plr)
+	if not nameOverrides[plr] then
+		nameOverrides[plr] = { manualHide = false, custom = nil }
+	end
+	return nameOverrides[plr]
+end
+
+local function makeNameRow(plr, order)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 56)
+	row.BackgroundColor3 = COL.btn
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = namesScroll
+	corner(row, 6)
+
+	local who = Instance.new("TextLabel")
+	who.Size = UDim2.new(1, -90, 0, 20)
+	who.Position = UDim2.new(0, 10, 0, 4)
+	who.BackgroundTransparency = 1
+	who.Text = plr == player and (plr.Name .. " (ты)") or plr.Name
+	who.TextColor3 = COL.text
+	who.TextXAlignment = Enum.TextXAlignment.Left
+	who.TextTruncate = Enum.TextTruncate.AtEnd
+	who.Font = Enum.Font.GothamMedium
+	who.TextSize = 12
+	who.Parent = row
+
+	-- кнопка скрытия
+	local hideBtn = Instance.new("TextButton")
+	hideBtn.Size = UDim2.new(0, 74, 0, 22)
+	hideBtn.Position = UDim2.new(1, -82, 0, 3)
+	hideBtn.AutoButtonColor = false
+	hideBtn.BorderSizePixel = 0
+	hideBtn.Font = Enum.Font.GothamMedium
+	hideBtn.TextSize = 11
+	hideBtn.TextColor3 = Color3.new(1, 1, 1)
+	hideBtn.Parent = row
+	corner(hideBtn, 6)
+
+	local function refreshHide()
+		local st = getOverride(plr)
+		hideBtn.BackgroundColor3 = st.manualHide and COL.skin or COL.off
+		hideBtn.Text = st.manualHide and "Скрыт" or "Показан"
+	end
+	refreshHide()
+	hideBtn.MouseButton1Click:Connect(function()
+		local st = getOverride(plr)
+		st.manualHide = not st.manualHide
+		refreshHide()
+	end)
+
+	-- поле переименования
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, -20, 0, 22)
+	box.Position = UDim2.new(0, 10, 0, 28)
+	box.BackgroundColor3 = COL.bg
+	box.PlaceholderText = "Новый ник (пусто = обычный)"
+	box.Text = ""
+	box.TextColor3 = COL.text
+	box.PlaceholderColor3 = COL.subtext
+	box.Font = Enum.Font.Gotham
+	box.TextSize = 12
+	box.ClearTextOnFocus = false
+	box.BorderSizePixel = 0
+	box.Parent = row
+	corner(box, 6)
+	padding(box, 6)
+
+	box.FocusLost:Connect(function()
+		local st = getOverride(plr)
+		st.custom = (box.Text ~= "" ) and box.Text or nil
+	end)
+
+	return row
+end
+
+local function rebuildNames()
+	for _, c in ipairs(namesScroll:GetChildren()) do
+		if c:IsA("Frame") then c:Destroy() end
+	end
+	local order = 0
+	-- сначала ты, потом остальные
+	makeNameRow(player, 0)
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then
+			order += 1
+			makeNameRow(plr, order)
+		end
+	end
+end
+
+hideAllBtn.MouseButton1Click:Connect(function()
+	hideAllOn = not hideAllOn
+	hideAllBtn.Text = hideAllOn and "Скрыть все ники: ВКЛ" or "Скрыть все ники: ВЫКЛ"
+	hideAllBtn.BackgroundColor3 = hideAllOn and COL.on or COL.btn
+	for _, plr in ipairs(Players:GetPlayers()) do
+		getOverride(plr).manualHide = hideAllOn
+	end
+	rebuildNames()
+end)
+
+rebuildNames()
+Players.PlayerAdded:Connect(function(plr)
+	if hideAllOn then getOverride(plr).manualHide = true end
+	task.defer(rebuildNames)
+end)
+Players.PlayerRemoving:Connect(function(plr)
+	nameOverrides[plr] = nil
+	tagCache[plr] = nil
+	task.defer(rebuildNames)
+end)
+
+--==================================================================
+--  ВКЛАДКА: SKINS  (выбор НПС, размер, процедурное ползанье — у тебя)
+--==================================================================
+local skinsPage = addTab("Skins")
+
+local selSkin = nil          -- выбранный НПС
+local crawling = {}          -- [npc] = true (кто сейчас ползёт)
+local crawlT = 0             -- время для синусоиды гребков
+local crawlBound = false
+local baseScale = {}         -- [npc] = исходный масштаб
+local skinScaleVal = 1
+-- живые параметры позы (правятся полями ниже)
+local cp = { body = 85, head = -75, height = 0, amp = 30 }
+
+local function rootOf(npc)
+	return npc:FindFirstChild("RootPart") or npc:FindFirstChild("HumanoidRootPart")
+end
+
+-- поза ползущего: жёстко наклоняем всё тело + гребки руками/ногами
+local function poseCrawl(npc)
+	local root = rootOf(npc)
+	if not root then return end
+	local moveRoot = npc:FindFirstChild("HumanoidRootPart") or root
+	local vel = moveRoot.AssemblyLinearVelocity
+	local speed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	local moveF = math.clamp(speed / 8, 0, 1)
+
+	local base = CFrame.new(0, cp.height, 0) * CFrame.Angles(math.rad(cp.body), 0, 0)
+	local headX = CFrame.Angles(math.rad(cp.head), 0, 0)
+	local s = math.sin(crawlT) * cp.amp * moveF
+
+	for _, j in ipairs(npc:GetDescendants()) do
+		if j:IsA("Motor6D") and j.Part0 == root then
+			local c0 = j.C0
+			local n = j.Part1 and j.Part1.Name or ""
+			local extra
+			if n == "Head" or n == "Head.002" or n == "Head.004" then
+				extra = headX
+			elseif n == "Body.007" or n == "Body.009" then     -- правая рука + левая нога
+				extra = CFrame.Angles(math.rad(s), 0, 0)
+			elseif n == "Body.008" or n == "Body.010" then     -- левая рука + правая нога
+				extra = CFrame.Angles(math.rad(-s), 0, 0)
+			else
+				extra = CFrame.new()
+			end
+			j.Transform = c0:Inverse() * base * c0 * extra
+		end
+	end
+end
+
+local function resetPose(npc)
+	local root = rootOf(npc)
+	if not root then return end
+	for _, j in ipairs(npc:GetDescendants()) do
+		if j:IsA("Motor6D") and j.Part0 == root then
+			j.Transform = CFrame.new()
+		end
+	end
+end
+
+local function ensureCrawlBound()
+	if crawlBound then return end
+	crawlBound = true
+	-- приоритет Last — выполняемся ПОСЛЕ игровой анимации, чтобы поза не сбивалась
+	RunService:BindToRenderStep("TyomichCrawl", Enum.RenderPriority.Last.Value, function(dt)
+		crawlT += dt * 8
+		for npc in pairs(crawling) do
+			if npc and npc.Parent then
+				poseCrawl(npc)
+			else
+				crawling[npc] = nil
+			end
+		end
+	end)
+end
+
+local function setCrawl(npc, on)
+	if not npc then return end
+	if on then
+		crawling[npc] = true
+		ensureCrawlBound()
+	else
+		crawling[npc] = nil
+		resetPose(npc)
+	end
+end
+
+local function scaleNPC(npc)
+	if not npc then return end
+	if not baseScale[npc] then
+		local ok, s = pcall(function() return npc:GetScale() end)
+		baseScale[npc] = ok and s or 1
+	end
+	pcall(function() npc:ScaleTo(baseScale[npc] * skinScaleVal) end)
+end
+
+--// интерфейс
+local skinsTitle = Instance.new("TextLabel")
+skinsTitle.Size = UDim2.new(1, 0, 0, 16)
+skinsTitle.BackgroundTransparency = 1
+skinsTitle.Text = "Выбери НПС"
+skinsTitle.TextColor3 = COL.subtext
+skinsTitle.TextXAlignment = Enum.TextXAlignment.Left
+skinsTitle.Font = Enum.Font.GothamBold
+skinsTitle.TextSize = 12
+skinsTitle.Parent = skinsPage
+
+local skinScroll = Instance.new("ScrollingFrame")
+skinScroll.Size = UDim2.new(1, 0, 1, -210)
+skinScroll.Position = UDim2.new(0, 0, 0, 20)
+skinScroll.BackgroundTransparency = 1
+skinScroll.BorderSizePixel = 0
+skinScroll.ScrollBarThickness = 4
+skinScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+skinScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+skinScroll.Parent = skinsPage
+
+local skinListLayout = Instance.new("UIListLayout")
+skinListLayout.Padding = UDim.new(0, 4)
+skinListLayout.SortOrder = Enum.SortOrder.Name
+skinListLayout.Parent = skinScroll
+
+-- кнопка ползанья (объявим заранее, обновляется при выборе)
+local crawlBtn
+
+local skinRows = {}   -- [npc] = button
+local function updateSkinHighlight()
+	for npc, b in pairs(skinRows) do
+		b.BackgroundColor3 = (npc == selSkin) and COL.accent or COL.btn
+	end
+end
+local function updateCrawlBtn()
+	local on = selSkin and crawling[selSkin]
+	if crawlBtn then
+		crawlBtn.Text = on and "Ползанье: ВКЛ" or "Ползанье: ВЫКЛ"
+		crawlBtn.BackgroundColor3 = on and COL.on or COL.btn
+	end
+end
+
+local function makeSkinRow(npc)
+	if skinRows[npc] then return end
+	local skin = isSkinwalker(npc)
+
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 28)
+	b.BackgroundColor3 = COL.btn
+	b.Text = ""
+	b.AutoButtonColor = false
+	b.BorderSizePixel = 0
+	b.Parent = skinScroll
+	corner(b, 6)
+
+	local nameLbl = Instance.new("TextLabel")
+	nameLbl.Size = UDim2.new(1, -56, 1, 0)
+	nameLbl.Position = UDim2.new(0, 10, 0, 0)
+	nameLbl.BackgroundTransparency = 1
+	nameLbl.Text = npc.Name
+	nameLbl.TextColor3 = COL.text
+	nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+	nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+	nameLbl.Font = Enum.Font.Gotham
+	nameLbl.TextSize = 12
+	nameLbl.Parent = b
+
+	local badge = Instance.new("TextLabel")
+	badge.Size = UDim2.new(0, 42, 0, 15)
+	badge.Position = UDim2.new(1, -48, 0.5, -7)
+	badge.BackgroundColor3 = skin and COL.skin or COL.safe
+	badge.Text = skin and "SKIN" or "SAFE"
+	badge.TextColor3 = Color3.new(1, 1, 1)
+	badge.Font = Enum.Font.GothamBold
+	badge.TextSize = 9
+	badge.BorderSizePixel = 0
+	badge.Parent = b
+	corner(badge, 4)
+
+	b.MouseButton1Click:Connect(function()
+		selSkin = npc
+		updateSkinHighlight()
+		updateCrawlBtn()
+		skinsTitle.Text = "Выбран: " .. npc.Name
+	end)
+
+	skinRows[npc] = b
+end
+
+local function rebuildSkinList()
+	for npc, b in pairs(skinRows) do
+		if not npc.Parent then b:Destroy(); skinRows[npc] = nil end
+	end
+	for _, npc in ipairs(npcFolder:GetChildren()) do
+		if npc:IsA("Model") and partCount(npc) > 0 then
+			makeSkinRow(npc)
+		end
+	end
+	updateSkinHighlight()
+end
+rebuildSkinList()
+
+npcFolder.ChildAdded:Connect(function() task.defer(rebuildSkinList) end)
+npcFolder.ChildRemoved:Connect(function(child)
+	crawling[child] = nil
+	baseScale[child] = nil
+	if selSkin == child then selSkin = nil; skinsTitle.Text = "Выбери НПС" end
+	task.defer(rebuildSkinList)
+end)
+
+-- ползунок размера (для выбранного)
+local skinSlider = makeSlider(skinsPage, "Размер, %  (100 = обычный)", 30, 300, 100, 1, function(v)
+	skinScaleVal = v / 100
+	if selSkin then scaleNPC(selSkin) end
+end)
+skinSlider.Position = UDim2.new(0, 0, 1, -190)
+
+-- тумблер ползанья
+crawlBtn = makeButton(skinsPage, "Ползанье: ВЫКЛ", 30)
+crawlBtn.Position = UDim2.new(0, 0, 1, -144)
+crawlBtn.Size = UDim2.new(1, 0, 0, 30)
+crawlBtn.MouseButton1Click:Connect(function()
+	if not selSkin then return end
+	setCrawl(selSkin, not crawling[selSkin])
+	updateCrawlBtn()
+end)
+updateCrawlBtn()
+
+-- подпись + поля тюнинга позы
+local tuneLbl = Instance.new("TextLabel")
+tuneLbl.Size = UDim2.new(1, 0, 0, 14)
+tuneLbl.Position = UDim2.new(0, 0, 1, -108)
+tuneLbl.BackgroundTransparency = 1
+tuneLbl.Text = "Поза: Тело / Голова / Высота / Гребки"
+tuneLbl.TextColor3 = COL.subtext
+tuneLbl.TextXAlignment = Enum.TextXAlignment.Left
+tuneLbl.Font = Enum.Font.Gotham
+tuneLbl.TextSize = 9
+tuneLbl.Parent = skinsPage
+
+local tuneRow = Instance.new("Frame")
+tuneRow.Size = UDim2.new(1, 0, 0, 24)
+tuneRow.Position = UDim2.new(0, 0, 1, -92)
+tuneRow.BackgroundTransparency = 1
+tuneRow.Parent = skinsPage
+
+local function makeTuneBox(default, xScale, onSet)
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(0.235, 0, 1, 0)
+	box.Position = UDim2.new(xScale, 0, 0, 0)
+	box.BackgroundColor3 = COL.btn
+	box.Text = tostring(default)
+	box.TextColor3 = COL.text
+	box.Font = Enum.Font.Gotham
+	box.TextSize = 12
+	box.ClearTextOnFocus = false
+	box.BorderSizePixel = 0
+	box.Parent = tuneRow
+	corner(box, 6)
+	box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n then onSet(n) else box.Text = tostring(default) end
+	end)
+end
+makeTuneBox(cp.body,   0,     function(n) cp.body = n end)
+makeTuneBox(cp.head,   0.255, function(n) cp.head = n end)
+makeTuneBox(cp.height, 0.51,  function(n) cp.height = n end)
+makeTuneBox(cp.amp,    0.765, function(n) cp.amp = n end)
+
+local skinsHint = Instance.new("TextLabel")
+skinsHint.Size = UDim2.new(1, 0, 0, 56)
+skinsHint.Position = UDim2.new(0, 0, 1, -62)
+skinsHint.BackgroundTransparency = 1
+skinsHint.Text = "Только у тебя. Поза накладывается поверх игровой анимации каждый кадр. Подгоняй числа: Тело — наклон вперёд (град), Голова — поворот назад/вверх, Высота — поднять/опустить, Гребки — амплитуда рук/ног при движении."
+skinsHint.TextColor3 = COL.subtext
+skinsHint.TextXAlignment = Enum.TextXAlignment.Left
+skinsHint.TextYAlignment = Enum.TextYAlignment.Top
+skinsHint.TextWrapped = true
+skinsHint.Font = Enum.Font.Gotham
+skinsHint.TextSize = 9
+skinsHint.Parent = skinsPage
 
 --==================================================================
 --  ПЕРЕТАСКИВАНИЕ ОКНА ЗА ШАПКУ
